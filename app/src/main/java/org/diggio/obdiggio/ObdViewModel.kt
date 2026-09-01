@@ -5,7 +5,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,9 +54,17 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private var transport: BleTransport? = null
     private var pollJob: Job? = null
 
+    // ---- Connection -----------------------------------------------------------
+
     fun connect(useMock: Boolean) {
         if (_state.value.connecting || _state.value.connected) return
-        _state.update { it.copy(connecting = true, connected = false, usingMock = useMock, status = "Connessione…", values = emptyMap(), boostKpa = null, dtcGroups = null, dtcBusy = false, freeze = null, freezeBusy = false, message = null) }
+        _state.update {
+            it.copy(
+                connecting = true, connected = false, usingMock = useMock,
+                status = "Connessione…", values = emptyMap(), boostKpa = null,
+                dtcGroups = null, dtcBusy = false, freeze = null, freezeBusy = false, message = null
+            )
+        }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val t = if (useMock) MockTransport(hasDtcs = false) else {
@@ -95,6 +102,20 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun disconnect() {
+        pollJob?.cancel()
+        pollJob = null
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { elm?.close() }
+            elm = null
+            withContext(Dispatchers.Main) {
+                _state.update { UiState() }
+            }
+        }
+    }
+
+    // ---- Polling --------------------------------------------------------------
+
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = viewModelScope.launch(Dispatchers.IO) {
@@ -102,6 +123,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 val results = mutableMapOf<String, PidResult>()
                 for (pid in dashboardPids) {
+                    // sendRaw is @Synchronized — if a DTC read is in flight this
+                    // call will simply block until that read finishes, so there is
+                    // no interleaving. No explicit locking needed here.
                     runCatching { e.readPid(pid) }.getOrNull()?.let { results[pid.key] = it }
                 }
                 val boost = computeBoost(results)
@@ -119,63 +143,113 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         return maxOf(map - baro, 0.0)
     }
 
+    // ---- DTC operations -------------------------------------------------------
+    // Pattern for every DTC / freeze operation:
+    //   1. Cancel pollJob — avoids concurrent commands on the same transport.
+    //      (sendRaw is also @Synchronized as a belt-and-suspenders guard.)
+    //   2. Perform the operation.
+    //   3. Restart pollJob when done (even on failure).
+    // This makes DTC reads reliable regardless of where the poll loop was.
+
     fun readDtcs() {
         val e = elm ?: return
-        _state.update { it.copy(dtcBusy = true) }
+        pollJob?.cancel()
+        pollJob = null
+        _state.update { it.copy(dtcBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            val groups = readAllDtcGroups(e)
-            withContext(Dispatchers.Main) {
-                _state.update { it.copy(dtcGroups = groups, dtcBusy = false) }
+            // Give any in-flight poll command a moment to drain before we start.
+            // (sendRaw times out after 5 s max, but normally finishes in <300 ms.)
+            delay(250)
+            runCatching {
+                val groups = readAllDtcGroups(e)
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(dtcGroups = groups, dtcBusy = false) }
+                }
+            }.onFailure { ex ->
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(dtcBusy = false, message = "Errore lettura DTC: ${ex.message}") }
+                }
             }
+            startPolling()
         }
     }
 
     fun clearDtcs() {
         val e = elm ?: return
-        _state.update { it.copy(dtcBusy = true) }
+        pollJob?.cancel()
+        pollJob = null
+        _state.update { it.copy(dtcBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { e.clearDtcs() }
-            withContext(Dispatchers.Main) {
-                _state.update { it.copy(dtcGroups = emptyList(), dtcBusy = false, message = "DTC cancellati") }
+            delay(250)
+            runCatching {
+                e.clearDtcs()
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(dtcGroups = emptyList(), dtcBusy = false, message = "DTC cancellati") }
+                }
+            }.onFailure { ex ->
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(dtcBusy = false, message = "Errore cancellazione DTC: ${ex.message}") }
+                }
             }
+            startPolling()
         }
     }
 
     fun readFreezeFrame() {
         val e = elm ?: return
-        _state.update { it.copy(freezeBusy = true) }
+        pollJob?.cancel()
+        pollJob = null
+        _state.update { it.copy(freezeBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            val result = runCatching {
+            delay(250)
+            runCatching {
                 val dtc = e.readFreezeFrameDtc()
                 val pids = FREEZE_CODES.mapNotNull { Pids[it] }
                 val values = pids.mapNotNull { runCatching { e.readFreezeFramePid(it) }.getOrNull() }
                 FreezeFrame(dtc, values)
-            }.getOrNull()
-            withContext(Dispatchers.Main) {
-                _state.update { it.copy(freeze = result, freezeBusy = false) }
-            }
+            }.fold(
+                onSuccess = { frame ->
+                    withContext(Dispatchers.Main) {
+                        _state.update { it.copy(freeze = frame, freezeBusy = false) }
+                    }
+                },
+                onFailure = { ex ->
+                    withContext(Dispatchers.Main) {
+                        _state.update { it.copy(freezeBusy = false, message = "Errore freeze frame: ${ex.message}") }
+                    }
+                }
+            )
+            startPolling()
         }
     }
 
     private fun readAllDtcGroups(e: Elm327): List<DtcGroup> {
-        fun safe(fn: () -> List<Dtc>) = runCatching { fn() }.getOrElse { emptyList() }
-        return listOf(
-            DtcGroup("Memorizzati", safe { e.readDtcs() }),
-            DtcGroup("In sospeso", safe { e.readPendingDtcs() }),
-            DtcGroup("Permanenti", safe { e.readPermanentDtcs() })
-        ).filter { it.codes.isNotEmpty() }
-    }
+        // Each mode is read separately. Failures are surfaced via state.message rather
+        // than silently swallowed, while still returning whatever groups succeeded.
+        val errors = mutableListOf<String>()
+        fun safe(label: String, fn: () -> List<Dtc>): List<Dtc> =
+            runCatching(fn).getOrElse { ex ->
+                errors.add("$label: ${ex.message}")
+                emptyList()
+            }
 
-    fun disconnect() {
-        pollJob?.cancel()
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { elm?.close() }
-            elm = null
-            withContext(Dispatchers.Main) {
-                _state.update { UiState() }
+        val groups = listOf(
+            DtcGroup("Memorizzati",  safe("Mode 03") { e.readDtcs() }),
+            DtcGroup("In sospeso",   safe("Mode 07") { e.readPendingDtcs() }),
+            DtcGroup("Permanenti",   safe("Mode 0A") { e.readPermanentDtcs() })
+        ).filter { it.codes.isNotEmpty() }
+
+        if (errors.isNotEmpty()) {
+            // Report in state so the user can see what went wrong
+            val msg = errors.joinToString(" | ")
+            viewModelScope.launch(Dispatchers.Main) {
+                _state.update { it.copy(message = msg) }
             }
         }
+        return groups
     }
+
+    // ---- Helpers --------------------------------------------------------------
 
     private suspend fun setStatus(s: String) = withContext(Dispatchers.Main) {
         _state.update { it.copy(status = s) }

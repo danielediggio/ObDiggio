@@ -8,14 +8,18 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
 
     companion object {
         private val INIT_COMMANDS = listOf(
-            "ATZ" to 1000L,
-            "ATE0" to 300L,
-            "ATL0" to 300L,
-            "ATS1" to 300L,
-            "ATH0" to 300L,
-            "ATSP0" to 300L
+            "ATZ"   to 1500L,   // hardware reset — longer settle for reliable reinit
+            "ATE0"  to 300L,    // echo off
+            "ATL0"  to 300L,    // linefeeds off
+            "ATS1"  to 300L,    // spaces on (easier parsing)
+            "ATH0"  to 300L,    // headers off
+            "ATSP0" to 500L     // auto-detect protocol
         )
         private val HEX = "0123456789ABCDEF".toSet()
+        // Strings that indicate the ELM327 could not talk to the ECU
+        private val NO_RESPONSE_TOKENS = setOf(
+            "UNABLE", "ERROR", "NODATA", "BUSBUSY", "BUSERROR", "CANERROR", "STOPPED", "?"
+        )
 
         fun clean(raw: String): String {
             return raw.replace(">", " ")
@@ -57,12 +61,70 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         }
     }
 
+    // ---- Synchronised transport access ----------------------------------------
+    // All OBD communication must go through sendRaw. The @Synchronized annotation
+    // makes every call mutually exclusive on this Elm327 instance, so the polling
+    // loop and a DTC read launched from a different coroutine can never interleave
+    // their writes/reads on the shared BLE transport.
+
+    @Synchronized
+    private fun sendRaw(command: String): String {
+        transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
+        val raw = transport.readUntil('>', timeoutMs)
+        return String(raw, Charsets.US_ASCII)
+    }
+
+    fun query(command: String): String = clean(sendRaw(command))
+
+    // ---- Connection -----------------------------------------------------------
+
     fun connect() {
         if (!transport.isConnected) transport.open()
         initialize()
         initialized = true
-        runCatching { query("0100") }
+        // Probe the OBD bus. If auto-detect (ATSP0) did not find a working protocol,
+        // try the protocols most common on VAG / Audi (and most modern CAN cars):
+        //   ATSP6 = ISO 15765-4 CAN 11-bit 500 kbaud  (Golf, A4, most petrol/diesel)
+        //   ATSP7 = ISO 15765-4 CAN 29-bit 500 kbaud  (some VAG variants)
+        //   ATSP5 = ISO 15765-4 CAN 11-bit 250 kbaud  (older / body-bus ECUs)
+        val probe = runCatching { query("0100") }.getOrElse { "" }
+        if (isNoResponse(probe)) {
+            if (!tryForceProtocol("ATSP6") && !tryForceProtocol("ATSP7")) {
+                tryForceProtocol("ATSP5")
+            }
+        }
     }
+
+    private fun isNoResponse(response: String): Boolean {
+        if (response.isBlank()) return true
+        val upper = response.uppercase().replace(" ", "")
+        return NO_RESPONSE_TOKENS.any { it in upper }
+    }
+
+    /** Send an ATSPx command and probe with 0100. Returns true if the ECU answered. */
+    private fun tryForceProtocol(atCmd: String): Boolean {
+        runCatching {
+            sendRaw(atCmd)
+            Thread.sleep(500)
+        }
+        val probe = runCatching { query("0100") }.getOrElse { "" }
+        return !isNoResponse(probe)
+    }
+
+    fun initialize() {
+        transport.clear()
+        for ((cmd, settle) in INIT_COMMANDS) {
+            sendRaw(cmd)
+            Thread.sleep(settle)
+        }
+    }
+
+    fun close() {
+        initialized = false
+        transport.close()
+    }
+
+    // ---- PID support ----------------------------------------------------------
 
     fun probeSupportedPids(): String = query("0100")
 
@@ -83,43 +145,35 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         return supported
     }
 
-    fun close() {
-        initialized = false
-        transport.close()
-    }
-
-    fun initialize() {
-        transport.clear()
-        for ((cmd, settle) in INIT_COMMANDS) {
-            sendRaw(cmd)
-            Thread.sleep(settle)
-        }
-    }
-
-    private fun sendRaw(command: String): String {
-        transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
-        val raw = transport.readUntil('>', timeoutMs)
-        return String(raw, Charsets.US_ASCII)
-    }
-
-    fun query(command: String): String = clean(sendRaw(command))
-
     fun readPid(pid: Pid): PidResult {
         val bytes = parseHexBytes(query(pid.command()))
         val data = stripModeHeader(bytes, 1, pid.code) ?: return PidResult(pid, null, pid.unit)
         return pid.decode(data)
     }
 
+    // ---- DTC reading ----------------------------------------------------------
+
     fun readDtcs(): List<Dtc> = readDtcsForMode("03", 3)
     fun readPendingDtcs(): List<Dtc> = readDtcsForMode("07", 7)
     fun readPermanentDtcs(): List<Dtc> = readDtcsForMode("0A", 10)
 
     private fun readDtcsForMode(command: String, responseMode: Int): List<Dtc> {
-        val bytes = parseHexBytes(query(command))
+        val raw = query(command)
+        // Surface "NO DATA" / "UNABLE" as an empty list (no stored DTCs).
+        // This is normal when the car has no faults.
+        if (isNoResponse(raw)) return emptyList()
+        val bytes = parseHexBytes(raw)
         val data = stripModeHeader(bytes, responseMode) ?: return emptyList()
+        // After stripping the 0x43/0x47/0x4A response byte, some ECUs (especially
+        // on K-line) prepend a DTC count byte. Since each DTC is exactly 2 bytes, an
+        // odd-length payload means a leading count byte is present — strip it.
         val payload = if (data.size % 2 == 1) data.copyOfRange(1, data.size) else data
         return Dtc.decodeBytes(payload)
     }
+
+    fun clearDtcs(): Boolean = parseHexBytes(query("04")).contains(0x44)
+
+    // ---- Freeze frame ---------------------------------------------------------
 
     fun readFreezeFramePid(pid: Pid): PidResult {
         val bytes = parseHexBytes(query("02%02X00".format(pid.code)))
@@ -137,7 +191,7 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         return Dtc.decode(bytes[idx + 3], bytes[idx + 4])
     }
 
-    fun clearDtcs(): Boolean = parseHexBytes(query("04")).contains(0x44)
+    // ---- Misc -----------------------------------------------------------------
 
     fun voltage(): Double? {
         val digits = query("ATRV").filter { it.isDigit() || it == '.' }
