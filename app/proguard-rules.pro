@@ -1,0 +1,3 @@
+-keep class org.diggio.obdiggio.** { *; }
+-keepattributes *Annotation*
+-dontwarn kotlin.**
