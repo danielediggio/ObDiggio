@@ -1,9 +1,15 @@
 package org.diggio.obdiggio
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -29,12 +35,14 @@ import androidx.compose.foundation.shape.CutCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -49,6 +57,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -56,6 +65,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import org.diggio.obdiggio.core.obd.Pid
 import org.diggio.obdiggio.core.obd.PidResult
 import org.diggio.obdiggio.core.vag.VagEcuResult
@@ -82,6 +92,7 @@ private enum class Screen(val title: String, val symbol: String) {
     DASHBOARD("LIVE", "RPM"),
     DTC("SCAN", "DTC"),
     FREEZE("FREEZE", "FRZ"),
+    PROFILE("C6 FILE", "ECU"),
     CONNECT("GARAGE", "BLE")
 }
 
@@ -102,6 +113,28 @@ class MainActivity : ComponentActivity() {
 private fun ObdiggioApp(vm: ObdViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     var currentScreen by remember { mutableStateOf(Screen.CONNECT) }
+    val context = LocalContext.current
+    val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted.values.all { it }) vm.scanDevices()
+    }
+    val onScanDevices = {
+        val granted = bluetoothPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        if (granted) vm.scanDevices() else permissionLauncher.launch(bluetoothPermissions)
+    }
+    val shareText: (String, String) -> Unit = { subject, content ->
+        val intent = Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, subject)
+            .putExtra(Intent.EXTRA_TEXT, content)
+        context.startActivity(Intent.createChooser(intent, "Condividi bundle diagnostico"))
+    }
 
     LaunchedEffect(state.connected) {
         if (state.connected) currentScreen = Screen.DASHBOARD
@@ -123,10 +156,16 @@ private fun ObdiggioApp(vm: ObdViewModel) {
                         onVagClear = { vm.clearVagDtcs() }
                     )
                     Screen.FREEZE -> FreezeScreen(state, onRead = { vm.readFreezeFrame() })
+                    Screen.PROFILE -> ProfileScreen(
+                        state,
+                        onShare = { shareText("ObDiggio C6 diagnostic bundle", vm.diagnosticBundle()) },
+                        onSharePreReset = { vm.preResetBundle()?.let { shareText("ObDiggio pre-reset backup", it) } }
+                    )
                     Screen.CONNECT -> ConnectScreen(
                         state = state,
-                        onConnect = { vm.connect(false) },
-                        onMock = { vm.connect(true) },
+                        onScan = onScanDevices,
+                        onConnect = { device -> vm.connect(device) },
+                        onMock = { vm.connect(useMock = true) },
                         onDisconnect = { vm.disconnect() }
                     )
                 }
@@ -140,6 +179,7 @@ private fun accent(screen: Screen): Color = when (screen) {
     Screen.DASHBOARD -> AcidGreen
     Screen.DTC -> NeonPink
     Screen.FREEZE -> NeonCyan
+    Screen.PROFILE -> NeonGreen
     Screen.CONNECT -> NeonOrange
 }
 
@@ -364,13 +404,14 @@ private fun OdbDtcContent(state: UiState, onRead: () -> Unit, onClear: () -> Uni
 @Composable
 private fun VagDtcContent(state: UiState, onScan: () -> Unit, onClear: () -> Unit, busy: Boolean) {
     val hasVagDtcs = state.vagResults?.any { it.dtcs.isNotEmpty() } == true
+    var showResetConfirmation by remember { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NeonButton("SCAN ECU", NeonOrange, modifier = Modifier.weight(1f), onClick = onScan, enabled = !busy)
-            NeonButton("CLEAR ALL", Steel, modifier = Modifier.weight(1f), onClick = onClear, enabled = !busy && hasVagDtcs)
+            NeonButton("C6 INVENTORY", NeonOrange, modifier = Modifier.weight(1f), onClick = onScan, enabled = !busy)
+            NeonButton("RESET ALL DTC", WarningRed, modifier = Modifier.weight(1f), onClick = { showResetConfirmation = true }, enabled = !busy && state.vagResults?.any { it.alive } == true)
         }
-        InfoRibbon("CAN physical address - UDS 19 02 FF - ABS, airbag, immobilizer, cambio")
+        InfoRibbon("A6 C6: TP2.0 + KWP2000, inventory read-only, trace export enabled")
 
         when {
             state.vagBusy -> Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -386,16 +427,26 @@ private fun VagDtcContent(state: UiState, onScan: () -> Unit, onClear: () -> Uni
                     }
                 }
             }
-            state.vagResults == null -> EmptyGarage("VAG MULTI-ECU", "Scansione centraline in stile OBDeleven, con lista ECU e DTC per modulo.")
-            state.vagResults.isEmpty() -> EmptyGarage("NO RESPONSE", "Nessuna ECU risponde sul protocollo CAN selezionato.")
+            state.vagResults == null -> EmptyGarage("C6 ECU INVENTORY", "Apre canali TP2.0, identifica le centraline e salva le tracce per completare i dati specifici.")
+            state.vagResults.isEmpty() -> EmptyGarage("NO RESPONSE", "Nessuna ECU ha risposto sul canale TP2.0 selezionato.")
             else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(7.dp)) {
                 item {
                     val alive = state.vagResults.count { it.alive }
-                    val dtcCount = state.vagResults.sumOf { it.dtcs.size }
-                    SectionLabel("$alive/${state.vagResults.size} ECU ONLINE - $dtcCount DTC", NeonOrange)
+                    SectionLabel("$alive/${state.vagResults.size} ECU IDENTIFICATE", NeonOrange)
                 }
                 items(state.vagResults) { r -> VagEcuCard(r, scanning = false) }
             }
+        }
+        if (showResetConfirmation) {
+            AlertDialog(
+                onDismissRequest = { showResetConfirmation = false },
+                title = { Text("Reset DTC su tutte le ECU online?") },
+                text = { Text("Verranno cancellati solo i codici guasto. Coding, adattamenti e immobilizer non vengono toccati. Il bundle pre-reset viene salvato nell'app.") },
+                confirmButton = {
+                    TextButton(onClick = { showResetConfirmation = false; onClear() }) { Text("RESET DTC") }
+                },
+                dismissButton = { TextButton(onClick = { showResetConfirmation = false }) { Text("ANNULLA") } }
+            )
         }
     }
 }
@@ -420,6 +471,7 @@ private fun VagEcuCard(result: VagEcuResult, scanning: Boolean) {
             when {
                 scanning && !result.alive -> StatusPill("SCAN", Steel)
                 !result.alive -> StatusPill("NO RESP", Steel)
+                result.identity != null -> StatusPill("IDENTIFIED", NeonCyan)
                 result.dtcs.isEmpty() -> StatusPill("OK", NeonGreen)
                 else -> StatusPill("${result.dtcs.size} DTC", WarningRed)
             }
@@ -428,6 +480,10 @@ private fun VagEcuCard(result: VagEcuResult, scanning: Boolean) {
         result.error?.let {
             Spacer(modifier = Modifier.height(6.dp))
             Text(it, color = Steel.copy(alpha = 0.65f), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        }
+        result.identity?.let { identity ->
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(identity, color = NeonCyan, fontSize = 10.sp, fontFamily = FontFamily.Monospace, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
 
         if (expanded && result.dtcs.isNotEmpty()) {
@@ -480,7 +536,51 @@ private fun FreezeScreen(state: UiState, onRead: () -> Unit) {
 }
 
 @Composable
-private fun ConnectScreen(state: UiState, onConnect: () -> Unit, onMock: () -> Unit, onDisconnect: () -> Unit) {
+private fun ProfileScreen(state: UiState, onShare: () -> Unit, onSharePreReset: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        UndergroundPanel(accent = AcidGreen) {
+            Text("C6 VEHICLE FILE", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+            Text("Profilo in sola lettura e bundle per analisi condivisa", color = Steel, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        }
+        UndergroundPanel(accent = NeonCyan) {
+            Text("VEHICLE", color = NeonCyan, fontSize = 10.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+            ProfileLine("VIN", state.vehicle?.vin ?: "Non disponibile via Mode 09")
+            ProfileLine("CAL ID", state.vehicle?.calibrationId ?: "Non disponibile")
+            ProfileLine("READINESS", state.vehicle?.readinessRaw ?: "Non letto")
+            ProfileLine("MODE 09", state.vehicle?.supportedInfoPids?.joinToString { "%02X".format(it) } ?: "Non letto")
+        }
+        UndergroundPanel(accent = NeonOrange) {
+            Text("ADAPTER", color = NeonOrange, fontSize = 10.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+            ProfileLine("ID", state.adapter?.identifier ?: "Non connesso")
+            ProfileLine("INFO", state.adapter?.description ?: "Non disponibile")
+            ProfileLine("PROTOCOL", state.adapter?.protocol ?: "Non disponibile")
+            ProfileLine("VOLTAGE", state.adapter?.voltage?.let { "%.2f V".format(it) } ?: "Non disponibile")
+        }
+        NeonButton("SHARE DIAGNOSTIC BUNDLE", AcidGreen, modifier = Modifier.fillMaxWidth(), onClick = onShare, enabled = state.connected)
+        if (state.resetBackupAvailable) {
+            NeonButton("SHARE PRE-RESET BACKUP", NeonOrange, modifier = Modifier.fillMaxWidth(), onClick = onSharePreReset)
+        }
+    }
+}
+
+@Composable
+private fun ProfileLine(label: String, value: String) {
+    Spacer(modifier = Modifier.height(7.dp))
+    Text(label, color = Steel, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+    Text(value, color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 2, overflow = TextOverflow.Ellipsis)
+}
+
+@Composable
+private fun ConnectScreen(
+    state: UiState,
+    onScan: () -> Unit,
+    onConnect: (org.diggio.obdiggio.ble.BleDevice) -> Unit,
+    onMock: () -> Unit,
+    onDisconnect: () -> Unit
+) {
     Column(
         modifier = Modifier.fillMaxSize().padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -491,7 +591,7 @@ private fun ConnectScreen(state: UiState, onConnect: () -> Unit, onMock: () -> U
                 Text("GARAGE LINK", color = NeonOrange, fontSize = 12.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace, letterSpacing = 2.sp)
                 Spacer(modifier = Modifier.height(12.dp))
                 Text("OBDIGGIO", color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace, letterSpacing = 5.sp)
-                Text("BLE OBD-II TUNER DIAGNOSTICS", color = Steel, fontSize = 11.sp, fontFamily = FontFamily.Monospace, letterSpacing = 1.sp)
+                Text("BLE + BT CLASSIC OBD-II DIAGNOSTICS", color = Steel, fontSize = 11.sp, fontFamily = FontFamily.Monospace, letterSpacing = 1.sp)
                 Spacer(modifier = Modifier.height(24.dp))
 
                 if (state.connected) {
@@ -499,7 +599,23 @@ private fun ConnectScreen(state: UiState, onConnect: () -> Unit, onMock: () -> U
                     Spacer(modifier = Modifier.height(16.dp))
                     NeonButton("DISCONNECT", WarningRed, modifier = Modifier.fillMaxWidth(), onClick = onDisconnect)
                 } else {
-                    NeonButton(if (state.connecting) "PAIRING..." else "CONNECT BLE", NeonOrange, modifier = Modifier.fillMaxWidth(), onClick = onConnect, enabled = !state.connecting)
+                    NeonButton(
+                        if (state.deviceScanBusy) "SCANNING..." else "SCAN ADAPTERS",
+                        NeonOrange,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = onScan,
+                        enabled = !state.connecting && !state.deviceScanBusy
+                    )
+                    state.devices.forEach { device ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        NeonButton(
+                            "${if (device.connection.name == "BLE") "BLE" else "BT"}  CONNECT ${device.name.take(16)}",
+                            NeonCyan,
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = { onConnect(device) },
+                            enabled = !state.connecting
+                        )
+                    }
                     Spacer(modifier = Modifier.height(10.dp))
                     NeonButton("SIMULATOR MODE", Steel, modifier = Modifier.fillMaxWidth(), onClick = onMock, enabled = !state.connecting)
                     if (state.connecting) {

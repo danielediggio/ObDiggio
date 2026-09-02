@@ -13,12 +13,18 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.diggio.obdiggio.ble.BleTransport
+import org.diggio.obdiggio.ble.BleDevice
+import org.diggio.obdiggio.ble.AdapterConnection
+import org.diggio.obdiggio.ble.ClassicBluetoothTransport
+import org.diggio.obdiggio.core.obd.AdapterProfile
+import org.diggio.obdiggio.core.obd.DiagnosticBundle
 import org.diggio.obdiggio.core.obd.Dtc
 import org.diggio.obdiggio.core.obd.Elm327
 import org.diggio.obdiggio.core.obd.Pid
 import org.diggio.obdiggio.core.obd.PidResult
 import org.diggio.obdiggio.core.obd.MockTransport
 import org.diggio.obdiggio.core.obd.Pids
+import org.diggio.obdiggio.core.obd.VehicleSnapshot
 import org.diggio.obdiggio.core.vag.VagDiag
 import org.diggio.obdiggio.core.vag.VagEcuResult
 import org.diggio.obdiggio.core.vag.VagEcus
@@ -32,6 +38,11 @@ data class UiState(
     val connected: Boolean = false,
     val usingMock: Boolean = false,
     val status: String = "Non connesso",
+    val deviceScanBusy: Boolean = false,
+    val devices: List<BleDevice> = emptyList(),
+    val adapter: AdapterProfile? = null,
+    val vehicle: VehicleSnapshot? = null,
+    val resetBackupAvailable: Boolean = false,
     val values: Map<String, PidResult> = emptyMap(),
     val boostKpa: Double? = null,
     // ── Standard OBD-II DTC ───────────────────────────────────────────────────
@@ -61,38 +72,61 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     private var elm: Elm327? = null
-    private var transport: BleTransport? = null
+    private var bleTransport: BleTransport? = null
     private var pollJob: Job? = null
+    private var lastPreResetBundle: String? = null
 
     // ── Connection ────────────────────────────────────────────────────────────
 
-    fun connect(useMock: Boolean) {
+    fun scanDevices() {
+        if (_state.value.deviceScanBusy || _state.value.connecting || _state.value.connected) return
+        _state.update { it.copy(deviceScanBusy = true, devices = emptyList(), message = null, status = "Scansione BLE + Bluetooth associati…") }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val ble = BleTransport(getApplication())
+                val devices = (ble.scan() + ClassicBluetoothTransport.bondedDevices(getApplication()))
+                    .distinctBy { it.address }
+                bleTransport = ble
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(deviceScanBusy = false, devices = devices, status = "${devices.size} adattatori trovati") }
+                }
+            }.onFailure { exception ->
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(deviceScanBusy = false, status = "Errore ricerca adattatori: ${exception.message}") }
+                }
+            }
+        }
+    }
+
+    fun connect(device: BleDevice? = null, useMock: Boolean = false) {
         if (_state.value.connecting || _state.value.connected) return
         _state.update {
             it.copy(
                 connecting = true, connected = false, usingMock = useMock,
                 status = "Connessione…", values = emptyMap(), boostKpa = null,
                 dtcGroups = null, dtcBusy = false, freeze = null, freezeBusy = false,
-                vagResults = null, vagBusy = false, message = null
+                vagResults = null, vagBusy = false, message = null, adapter = null, vehicle = null
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val t = if (useMock) MockTransport(hasDtcs = false) else {
-                    BleTransport(getApplication()).also { ble ->
-                        transport = ble
-                        setStatus("Scansione BLE…")
-                        ble.scan()
-                        val dev = ble.devices.firstOrNull { it.looksLikeObd() }
-                            ?: ble.devices.firstOrNull()
-                            ?: error("Nessun dispositivo OBD trovato")
-                        setStatus("Connessione a ${dev.name}…")
-                        ble.select(dev)
+                    val selected = device ?: error("Seleziona un adattatore BLE")
+                    setStatus("Connessione a ${selected.name}…")
+                    when (selected.connection) {
+                        AdapterConnection.BLE -> {
+                            val ble = bleTransport ?: error("Prima cerca un adattatore BLE")
+                            ble.select(selected)
+                            ble
+                        }
+                        AdapterConnection.CLASSIC -> ClassicBluetoothTransport(getApplication(), selected.address)
                     }
                 }
                 val e = Elm327(t)
                 elm = e
                 e.connect()
+                val adapter = runCatching { e.readAdapterProfile() }.getOrNull()
+                val vehicle = runCatching { e.readVehicleSnapshot() }.getOrNull()
                 val supported = runCatching { e.supportedPids() }.getOrElse { emptySet() }
                 val pids = if (supported.isEmpty()) {
                     DEFAULT_CODES.mapNotNull { Pids[it] }
@@ -102,7 +136,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 dashboardPids = pids
                 withContext(Dispatchers.Main) {
-                    _state.update { it.copy(connecting = false, connected = true, status = "Connesso") }
+                    _state.update { it.copy(connecting = false, connected = true, status = "Connesso", adapter = adapter, vehicle = vehicle) }
                 }
                 startPolling()
             }.onFailure { ex ->
@@ -119,6 +153,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { elm?.close() }
             elm = null
+            bleTransport = null
             withContext(Dispatchers.Main) { _state.update { UiState() } }
         }
     }
@@ -242,11 +277,11 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     // ── VAG multi-ECU operations ──────────────────────────────────────────────
 
     /**
-     * Scan all known VAG ECUs and immediately read their DTCs.
+     * Scan known C6 logical addresses, open a TP2.0 channel and read ECU identity.
      *
      * Flow:
      *   1. Cancel poll job (exclusive transport access)
-     *   2. For each ECU: probe with TesterPresent, then read DTCs via UDS 19 02 FF
+     *   2. For each ECU: open the TP2.0/KWP2000 channel and read its identity
      *   3. Update state incrementally after each ECU so the UI shows progress
      *   4. Restore functional addressing (ATSH 7DF)
      *   5. Restart poll job
@@ -270,11 +305,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             runCatching { diag.restoreFunctionalAddress() }
-            val totalDtcs = collected.sumOf { it.dtcs.size }
-            val msg = when {
-                totalDtcs == 0 -> "Scan VAG completato — nessun DTC trovato"
-                else           -> "Scan VAG: $totalDtcs DTC in ${collected.count { it.dtcs.isNotEmpty() }} ECU"
-            }
+            val online = collected.count { it.alive }
+            val msg = "Inventario C6 completato — $online/${collected.size} ECU identificate"
             withContext(Dispatchers.Main) {
                 _state.update { it.copy(vagBusy = false, vagProgress = "", message = msg) }
             }
@@ -283,33 +315,62 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Clear DTCs on all VAG ECUs that have faults (UDS service 0x14).
+     * Clears DTC memory only, after saving an in-app diagnostic snapshot.
      */
     fun clearVagDtcs() {
         val e = elm ?: return
-        val currentResults = _state.value.vagResults?.filter { it.alive && it.dtcs.isNotEmpty() }
-        if (currentResults.isNullOrEmpty()) return
+        val onlineEcus = _state.value.vagResults.orEmpty().filter { it.alive }
+        if (onlineEcus.isEmpty()) {
+            _state.update { it.copy(message = "Prima esegui C6 INVENTORY: servono ECU online da resettare") }
+            return
+        }
+        lastPreResetBundle = diagnosticBundle()
         pollJob?.cancel(); pollJob = null
-        _state.update { it.copy(vagBusy = true, vagProgress = "Cancellazione DTC VAG…", message = null) }
+        _state.update { it.copy(vagBusy = true, vagProgress = "Backup salvato - reset DTC in corso…", message = null) }
         viewModelScope.launch(Dispatchers.IO) {
             delay(250)
+            val obdCleared = runCatching { e.clearDtcs() }.getOrDefault(false)
             val diag = VagDiag(e)
             var cleared = 0
-            for (result in currentResults) {
+            for (result in onlineEcus) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(vagProgress = "Reset DTC ${result.ecu.name}…") }
+                }
                 if (diag.clearDtcs(result.ecu)) cleared++
             }
             runCatching { diag.restoreFunctionalAddress() }
             withContext(Dispatchers.Main) {
-                _state.update { it.copy(
-                    vagBusy = false,
-                    vagProgress = "",
-                    vagResults = null,  // force re-scan to confirm
-                    message = "Cancellati DTC su $cleared ECU — esegui nuovo scan per verificare"
-                ) }
+                _state.update {
+                    it.copy(
+                        vagBusy = false,
+                        vagProgress = "",
+                        dtcGroups = null,
+                        vagResults = null,
+                        resetBackupAvailable = true,
+                        message = "Reset completato: OBD ${if (obdCleared) "ok" else "nessuna risposta"}, VAG $cleared/${onlineEcus.size}. Riesegui lo scan."
+                    )
+                }
             }
             startPolling()
         }
     }
+
+    fun diagnosticBundle(): String {
+        val current = _state.value
+        return DiagnosticBundle(
+            createdAt = java.time.Instant.now().toString(),
+            adapter = current.adapter,
+            vehicle = current.vehicle,
+            obdDtcs = current.dtcGroups.orEmpty().flatMap { it.codes }.distinctBy { it.code },
+            vagResults = current.vagResults.orEmpty().map { result ->
+                "${result.ecu.name}: ${if (result.alive) "online" else "offline"}; identity=${result.identity ?: "n/a"}; error=${result.error ?: "none"}"
+            },
+            liveValues = current.values,
+            trace = elm?.traceSnapshot().orEmpty()
+        ).asText()
+    }
+
+    fun preResetBundle(): String? = lastPreResetBundle
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

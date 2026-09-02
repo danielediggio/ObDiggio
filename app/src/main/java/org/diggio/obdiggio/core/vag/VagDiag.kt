@@ -1,235 +1,132 @@
 package org.diggio.obdiggio.core.vag
 
-import org.diggio.obdiggio.core.obd.Dtc
+import org.diggio.obdiggio.core.obd.CanFrame
 import org.diggio.obdiggio.core.obd.Elm327
-
-// ── Data model ────────────────────────────────────────────────────────────────
 
 data class VagDtcEntry(
     val code: String,
     val description: String,
     val statusByte: Int,
     val statusText: String,
-    val rawHex: String          // original 3-byte hex for reference (e.g. "012F 01")
+    val rawHex: String
 )
 
 data class VagEcuResult(
     val ecu: VagEcu,
-    val alive: Boolean,         // did the ECU respond at all?
+    val alive: Boolean,
     val dtcs: List<VagDtcEntry> = emptyList(),
+    val identity: String? = null,
+    val protocol: String = "TP2.0/KWP2000",
     val error: String? = null
 )
 
-// ── Diagnostics class ─────────────────────────────────────────────────────────
-
-/**
- * VAG-specific diagnostics over standard ELM327 / OBD-II port.
- *
- * Uses physical CAN addressing (ATSH) to interrogate individual ECUs with
- * UDS services instead of the generic OBD-II functional address (0x7DF).
- * This allows reading manufacturer-specific DTCs, including immobilizer
- * faults, gearbox codes, and other non-emission faults invisible to Mode 03.
- *
- * Session handling — ECUs with "additional protections" (e.g. Bosch EDC16 with
- * security coding, ZF TCU) often refuse service 0x19 in the DEFAULT session.
- * Before every DTC read we open an Extended Diagnostic Session (10 03); if the
- * ECU rejects even that we fall back gracefully and report the NRC code.
- *
- * All methods expect [pollJob] to be cancelled before being called so that
- * sendRaw() calls don't interleave. Elm327.queryPhysical() is @Synchronized
- * as an additional safeguard.
- */
+/** Read-only C6 inventory over TP2.0 carrying KWP2000 messages. */
 class VagDiag(private val elm: Elm327) {
 
-    // ── Public API ─────────────────────────────────────────────────────────────
-
-    /**
-     * Scan all known VAG ECUs. Returns one [VagEcuResult] per ECU.
-     * The probe is a lightweight UDS TesterPresent (3E 00) which every
-     * UDS-capable ECU must answer — much faster than a full DTC read.
-     * Unreachable ECUs (NO DATA / timeout) are marked alive=false.
-     */
-    fun scanEcus(): List<VagEcuResult> {
-        // Force ATSP6 (500kbaud CAN) before any physical-address query.
-        // Auto-detect (ATSP0) may fail when the engine won't start and Mode-01
-        // goes unanswered; without this the adapter could be on the wrong protocol.
-        elm.setupForVagCan()
-        return VagEcus.all.map { ecu ->
-            runCatching {
-                val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "3E 00")
-                val alive = isPositiveResponse(resp, 0x3E)
-                VagEcuResult(ecu = ecu, alive = alive,
-                    error = if (!alive) "Nessuna risposta" else null)
-            }.getOrElse { ex ->
-                VagEcuResult(ecu = ecu, alive = false, error = ex.message)
-            }
-        }
+    fun readDtcs(ecu: VagEcu): VagEcuResult = runCatching {
+        elm.setupForRawCan()
+        Tp20Channel.open(elm, ecu)?.use { channel ->
+            channel.enterDiagnostics()
+            VagEcuResult(ecu = ecu, alive = true, identity = channel.readIdentity())
+        } ?: VagEcuResult(ecu = ecu, alive = false, error = "Nessuna risposta TP2.0")
+    }.getOrElse { exception ->
+        VagEcuResult(ecu = ecu, alive = false, error = exception.message ?: "Errore TP2.0")
     }
 
-    /**
-     * Read DTCs from a single ECU.
-     *
-     * Protocol sequence:
-     *   1. TesterPresent (3E 00)  — verify the ECU is alive
-     *   2. Extended Diagnostic Session (10 03)  — unlock service 0x19 on
-     *      "protected" ECUs (Bosch EDC16, ZF 6HP, immobilizer ECUs).
-     *      If the ECU stays in default session it still answers 0x19, so
-     *      this step is safe even for ECUs that don't need it.
-     *   3. ReadDTCByStatusMask (19 02 FF)  — all DTCs regardless of status
-     *
-     * Returns [VagEcuResult] with [alive]=true on success or meaningful
-     * error descriptions including UDS NRC codes on failure.
-     */
-    fun readDtcs(ecu: VagEcu): VagEcuResult =
-        runCatching {
-            // Ensure correct protocol for standalone DTC reads (in case called without scanEcus)
-            elm.setupForVagCan()
+    fun readDtcsAll(ecus: List<VagEcu>): List<VagEcuResult> = ecus.map(::readDtcs)
 
-            // Step 1 — probe
-            val probe = elm.queryPhysical(ecu.txId, ecu.rxId, "3E 00")
-            if (!isPositiveResponse(probe, 0x3E)) {
-                val nrc = extractNrc(probe, 0x3E)
-                return@runCatching VagEcuResult(
-                    ecu = ecu, alive = false,
-                    error = if (nrc != null) "ECU non risponde (NRC $nrc)" else "Nessuna risposta"
-                )
-            }
+    /** Clear diagnostic faults only. This never changes coding, adaptation or immobilizer data. */
+    fun clearDtcs(ecu: VagEcu): Boolean = runCatching {
+        elm.setupForRawCan()
+        Tp20Channel.open(elm, ecu)?.use { channel ->
+            channel.enterDiagnostics()
+            channel.clearDiagnosticInformation()
+        } ?: false
+    }.getOrDefault(false)
 
-            // Step 2 — open extended session (needed for ECUs with additional protections)
-            // We ignore the response: if the ECU doesn't support it, it returns 7F and we
-            // still try the DTC read — many ECUs answer 0x19 in default session anyway.
-            elm.queryPhysical(ecu.txId, ecu.rxId, "10 03")
-
-            // Step 3 — read DTCs
-            val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "19 02 FF")
-            if (!isPositiveResponse(resp, 0x19)) {
-                val nrc = extractNrc(resp, 0x19)
-                val errMsg = when (nrc) {
-                    "22" -> "Accesso negato: centralina in condizioni non corrette (NRC 22) — motore acceso?"
-                    "33" -> "Accesso negato: sicurezza ECU attiva (NRC 33) — protezioni aggiuntive"
-                    "35" -> "Chiave di sicurezza non valida (NRC 35)"
-                    "31" -> "Servizio non supportato in questa sessione (NRC 31)"
-                    "11" -> "Servizio UDS 19h non supportato da questa ECU (NRC 11)"
-                    null -> "Nessuna risposta UDS dalla ECU"
-                    else -> "Risposta negativa ECU (NRC $nrc)"
-                }
-                return@runCatching VagEcuResult(ecu = ecu, alive = true, error = errMsg)
-            }
-
-            val bytes = Elm327.parseHexBytes(resp)
-            val dtcs  = parseUdsDtcs(bytes)
-            VagEcuResult(ecu = ecu, alive = true, dtcs = dtcs)
-        }.getOrElse { ex ->
-            VagEcuResult(ecu = ecu, alive = false, error = ex.message)
-        }
-
-    /** Read DTCs from every ECU in [ecus] in sequence. */
-    fun readDtcsAll(ecus: List<VagEcu>): List<VagEcuResult> = ecus.map { readDtcs(it) }
-
-    /**
-     * Clear DTCs on a single ECU using UDS service 0x14 (ClearDiagnosticInformation).
-     * Opens an extended session first (same reason as [readDtcs]).
-     * Returns true if the ECU answered with a positive response (0x54).
-     */
-    fun clearDtcs(ecu: VagEcu): Boolean =
-        runCatching {
-            elm.queryPhysical(ecu.txId, ecu.rxId, "10 03")   // extended session
-            val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "14 FF FF FF")
-            isPositiveResponse(resp, 0x14)
-        }.getOrElse { false }
-
-    /**
-     * Must be called after all physical-address queries to restore the
-     * ELM327 to functional addressing (0x7DF) so normal OBD-II polling works.
-     */
     fun restoreFunctionalAddress() = elm.resetToFunctional()
+}
 
-    // ── Private helpers ────────────────────────────────────────────────────────
+private class Tp20Channel private constructor(
+    private val elm: Elm327,
+    private val requestId: Int,
+    private val responseId: Int
+) : AutoCloseable {
+    private var txSequence = 0
 
-    /**
-     * Check that [response] contains a positive-response byte for [service]
-     * (positive = serviceId + 0x40). Filters out NO DATA, ERROR, etc.
-     */
-    private fun isPositiveResponse(response: String, service: Int): Boolean {
-        if (response.isBlank()) return false
-        val upper = response.uppercase().replace(" ", "")
-        val noResponse = listOf("NODATA", "ERROR", "UNABLE", "STOPPED", "CANERROR", "BUSERROR", "BUSBUSY")
-        if (noResponse.any { it in upper }) return false
-        val positiveHex = "%02X".format(service + 0x40)
-        return upper.contains(positiveHex)
-    }
+    companion object {
+        private const val SETUP_ID = 0x200
 
-    /**
-     * If [response] is a UDS negative response (7F serviceId NRC), return the
-     * two-character hex NRC string (e.g. "33" for securityAccessDenied).
-     * Returns null if the response is not a recognisable negative response.
-     *
-     * UDS negative response format: 7F <echo of service byte> <NRC byte>
-     */
-    private fun extractNrc(response: String, service: Int): String? {
-        val bytes = Elm327.parseHexBytes(response)
-        // Find the 0x7F marker
-        val idx = bytes.indexOf(0x7F)
-        if (idx == -1 || idx + 2 >= bytes.size) return null
-        if (bytes[idx + 1] != service) return null
-        return "%02X".format(bytes[idx + 2])
-    }
+        fun open(elm: Elm327, ecu: VagEcu): Tp20Channel? {
+            val setup = elm.queryCanFrame(
+                txId = SETUP_ID,
+                rxId = SETUP_ID + ecu.logicalAddress,
+                payload = intArrayOf(ecu.logicalAddress, 0xC0, 0x00, 0x10, 0x00, 0x03, 0x01)
+            ).firstOrNull()?.payload ?: return null
+            if (setup.size < 7 || setup[1] != 0xD0) return null
 
-    /**
-     * Parse raw UDS response bytes for service 0x19 subfunction 0x02.
-     *
-     * Response layout:
-     *   59 02 <statusAvailabilityMask> [dtcHighByte dtcMidByte dtcLowByte statusByte] ...
-     *
-     * Each DTC is 3 data bytes + 1 status byte = 4 bytes per entry.
-     * The 3-byte DTC code encodes the standard OBD-II fault in the first
-     * two bytes (same bit layout as Mode 03); the third byte is an
-     * implementation-specific sub-code (0x00 for generic codes).
-     */
-    private fun parseUdsDtcs(bytes: IntArray): List<VagDtcEntry> {
-        val startIdx = bytes.indexOf(0x59)
-        if (startIdx == -1 || startIdx + 3 > bytes.size) return emptyList()
-
-        // Skip: 0x59 (service echo) + 0x02 (subfunc echo) + mask byte = 3 bytes
-        var i = startIdx + 3
-        val result = mutableListOf<VagDtcEntry>()
-
-        while (i + 3 < bytes.size) {
-            val dtcH   = bytes[i]
-            val dtcM   = bytes[i + 1]
-            val dtcL   = bytes[i + 2]   // sub-code / 0x00 for standard codes
-            val status = bytes[i + 3]
-            i += 4
-
-            if (dtcH == 0 && dtcM == 0 && dtcL == 0) continue
-
-            val decoded = Dtc.decode(dtcH, dtcM)
-            val code    = decoded?.code ?: "RAW:%02X%02X%02X".format(dtcH, dtcM, dtcL)
-            val desc    = decoded?.description ?: Dtc.describe(code)
-            val rawHex  = if (dtcL != 0) "%02X%02X%02X/%02X".format(dtcH, dtcM, dtcL, status)
-                          else            "%02X%02X/%02X".format(dtcH, dtcM, status)
-
-            result.add(VagDtcEntry(code, desc, status, decodeStatusByte(status), rawHex))
+            val requestId = setup[4] or ((setup[5] and 0x0F) shl 8)
+            val responseId = setup[2] or ((setup[3] and 0x0F) shl 8)
+            return Tp20Channel(elm, requestId, responseId).also { it.negotiateTiming() }
         }
-        return result
     }
 
-    /**
-     * Decode the UDS DTC status byte (ISO 14229-1 Table D.1).
-     *
-     * Bit 7: warningIndicatorRequested  → MIL accesa
-     * Bit 5: testFailedSinceLastClear   → presente dopo reset
-     * Bit 3: confirmedDTC               → confermato
-     * Bit 2: pendingDTC                 → in sospeso
-     * Bit 0: testFailed                 → attivo ora
-     */
-    private fun decodeStatusByte(status: Int): String {
-        val parts = mutableListOf<String>()
-        if (status and 0x01 != 0) parts.add("attivo")
-        if (status and 0x04 != 0) parts.add("in sospeso")
-        if (status and 0x08 != 0) parts.add("confermato")
-        if (status and 0x20 != 0) parts.add("dopo reset")
-        if (status and 0x80 != 0) parts.add("MIL accesa")
-        return if (parts.isEmpty()) "storico" else parts.joinToString(" · ")
+    private fun negotiateTiming() {
+        val response = elm.queryCanFrame(requestId, responseId, intArrayOf(0xA0, 0x0F, 0x8A, 0xFF, 0x0A, 0xFF))
+        check(response.any { it.payload.firstOrNull() == 0xA1 }) { "Parametri TP2.0 non accettati" }
+    }
+
+    fun enterDiagnostics() {
+        val response = request(intArrayOf(0x10, 0x89))
+        check(response.size >= 2 && response[0] == 0x50 && response[1] == 0x89) { "Sessione KWP2000 non disponibile" }
+    }
+
+    fun readIdentity(): String? {
+        val response = request(intArrayOf(0x1A, 0x9B))
+        if (response.size < 3 || response[0] != 0x5A || response[1] != 0x9B) return null
+        return response.drop(2)
+            .filter { it in 0x20..0x7E }
+            .map { it.toChar() }
+            .joinToString("")
+            .trim()
+            .ifBlank { null }
+    }
+
+    fun clearDiagnosticInformation(): Boolean {
+        val response = request(intArrayOf(0x14, 0xFF, 0xFF, 0xFF))
+        return response.firstOrNull() == 0x54
+    }
+
+    private fun request(payload: IntArray): IntArray {
+        require(payload.size <= 5) { "La richiesta KWP2000 TP2.0 supera un frame" }
+        val first = 0x10 or (txSequence and 0x0F)
+        txSequence = (txSequence + 1) and 0x0F
+        val frames = elm.queryCanFrame(
+            txId = requestId,
+            rxId = responseId,
+            payload = intArrayOf(first, 0x00, payload.size) + payload,
+            responseTimeoutMs = 2_000
+        )
+        return decodeResponse(frames)
+    }
+
+    private fun decodeResponse(frames: List<CanFrame>): IntArray {
+        val dataFrames = frames.filter { frame ->
+            val opcode = frame.payload.firstOrNull()?.shr(4) ?: -1
+            opcode in 0..3
+        }
+        val first = dataFrames.firstOrNull() ?: return intArrayOf()
+        if (first.payload.size < 4) return intArrayOf()
+        val expectedLength = (first.payload[1] shl 8) or first.payload[2]
+        val result = dataFrames.flatMapIndexed { index, frame ->
+            if (index == 0) frame.payload.drop(3) else frame.payload.drop(1)
+        }.take(expectedLength)
+        val lastSequence = dataFrames.last().payload.first() and 0x0F
+        elm.queryCanFrame(requestId, responseId, intArrayOf(0xB0 or ((lastSequence + 1) and 0x0F)), 300)
+        return result.toIntArray()
+    }
+
+    override fun close() {
+        runCatching { elm.queryCanFrame(requestId, responseId, intArrayOf(0xA8), 300) }
     }
 }

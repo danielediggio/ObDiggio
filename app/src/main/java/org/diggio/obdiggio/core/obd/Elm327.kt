@@ -3,6 +3,7 @@ package org.diggio.obdiggio.core.obd
 class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
 
     private var initialized = false
+    private val trace = ArrayDeque<DiagnosticTrace>()
 
     val isConnected: Boolean get() = initialized && transport.isConnected
 
@@ -68,13 +69,18 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
     // their writes/reads on the shared BLE transport.
 
     @Synchronized
-    private fun sendRaw(command: String): String {
+    private fun sendRaw(command: String, responseTimeoutMs: Long = timeoutMs): String {
+        transport.clear()
         transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
-        val raw = transport.readUntil('>'.code.toByte(), timeoutMs)
-        return String(raw, Charsets.US_ASCII)
+        val response = String(transport.readUntil('>'.code.toByte(), responseTimeoutMs), Charsets.US_ASCII)
+        if (trace.size >= 500) trace.removeFirst()
+        trace.addLast(DiagnosticTrace(command = command, response = clean(response)))
+        return response
     }
 
     fun query(command: String): String = clean(sendRaw(command))
+
+    fun traceSnapshot(): List<DiagnosticTrace> = synchronized(this) { trace.toList() }
 
     /**
      * Force ISO 15765-4 CAN 500kbaud (ATSP6) and tune the adapter for VAG
@@ -94,6 +100,31 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         sendRaw("ATCAF1")       // auto-format: ELM327 handles ISO 15765-4 transport
         sendRaw("ATAT2")        // adaptive timing aggressive
         sendRaw("ATST19")       // per-frame timeout ~100ms
+    }
+
+    /**
+     * Configure the adapter for raw 11-bit CAN frames used by VAG TP2.0.
+     * This is read-only infrastructure: callers still decide which documented
+     * diagnostic request, if any, is sent after opening a TP2.0 channel.
+     */
+    @Synchronized
+    fun setupForRawCan() {
+        sendRaw("ATSP6", 500)
+        sendRaw("ATH1", 500)
+        sendRaw("ATCAF0", 500)
+        sendRaw("ATAL", 500)
+        sendRaw("ATAT2", 500)
+        sendRaw("ATST32", 500)
+    }
+
+    /** Send a single raw CAN frame and return only frames from [rxId]. */
+    @Synchronized
+    fun queryCanFrame(txId: Int, rxId: Int, payload: IntArray, responseTimeoutMs: Long = 1_500): List<CanFrame> {
+        require(payload.isNotEmpty() && payload.size <= 8) { "Un frame CAN deve contenere da 1 a 8 byte" }
+        sendRaw("ATSH %03X".format(txId), 500)
+        sendRaw("ATCRA %03X".format(rxId), 500)
+        val command = payload.joinToString(" ") { "%02X".format(it and 0xFF) }
+        return parseCanFrames(sendRaw(command, responseTimeoutMs)).filter { it.id == rxId }
     }
 
     /**
@@ -137,6 +168,10 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         transport.write("ATCRA\r".toByteArray(Charsets.US_ASCII))  // clear ATCRA filter
         transport.readUntil('>'.code.toByte(), 500)
         transport.write("ATSH 7DF\r".toByteArray(Charsets.US_ASCII))
+        transport.readUntil('>'.code.toByte(), 500)
+        transport.write("ATCAF1\r".toByteArray(Charsets.US_ASCII))
+        transport.readUntil('>'.code.toByte(), 500)
+        transport.write("ATH0\r".toByteArray(Charsets.US_ASCII))
         transport.readUntil('>'.code.toByte(), 500)
     }
 
@@ -237,6 +272,47 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
 
     fun clearDtcs(): Boolean = parseHexBytes(query("04")).contains(0x44)
 
+    fun readAdapterProfile(): AdapterProfile = AdapterProfile(
+        identifier = query("ATI"),
+        description = query("AT@1"),
+        protocol = query("ATDP"),
+        protocolNumber = query("ATDPN"),
+        voltage = voltage()
+    )
+
+    fun readVehicleSnapshot(): VehicleSnapshot {
+        val supported = parseSupportedInfoPids(query("0900"))
+        return VehicleSnapshot(
+            vin = readMode09Text(0x02),
+            calibrationId = readMode09Text(0x04),
+            supportedInfoPids = supported,
+            readinessRaw = query("0101")
+        )
+    }
+
+    private fun parseSupportedInfoPids(response: String): Set<Int> {
+        val bytes = parseHexBytes(response)
+        val index = bytes.indices.firstOrNull { it + 5 < bytes.size && bytes[it] == 0x49 && bytes[it + 1] == 0x00 }
+            ?: return emptySet()
+        val bits = (bytes[index + 2].toLong() shl 24) or (bytes[index + 3].toLong() shl 16) or
+            (bytes[index + 4].toLong() shl 8) or bytes[index + 5].toLong()
+        return buildSet {
+            for (bit in 0 until 32) if ((bits shr (31 - bit)) and 1L == 1L) add(bit + 1)
+        }
+    }
+
+    private fun readMode09Text(pid: Int): String? {
+        val bytes = parseHexBytes(query("09%02X".format(pid)))
+        val index = bytes.indices.firstOrNull { it + 2 < bytes.size && bytes[it] == 0x49 && bytes[it + 1] == pid }
+            ?: return null
+        return bytes.copyOfRange(index + 3, bytes.size)
+            .filter { it in 0x20..0x7E }
+            .map { it.toChar() }
+            .joinToString("")
+            .trim()
+            .ifBlank { null }
+    }
+
     // ---- Freeze frame ---------------------------------------------------------
 
     fun readFreezeFramePid(pid: Pid): PidResult {
@@ -262,3 +338,21 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
         return digits.toDoubleOrNull()
     }
 }
+
+data class CanFrame(val id: Int, val payload: IntArray)
+
+/** Parser for the header-enabled ELM327 output used in raw CAN mode. */
+fun parseCanFrames(raw: String): List<CanFrame> = raw.lineSequence().mapNotNull { line ->
+    val tokens = line.trim().uppercase().split(Regex("\\s+")).filter { it.isNotBlank() }
+    val idToken = tokens.firstOrNull() ?: return@mapNotNull null
+    if (idToken.length !in setOf(3, 8) || idToken.any { it !in "0123456789ABCDEF" }) return@mapNotNull null
+    val id = idToken.toIntOrNull(16) ?: return@mapNotNull null
+    var dataStart = 1
+    val declaredLength = tokens.getOrNull(dataStart)?.takeIf { it.length == 1 }?.toIntOrNull(16)
+    if (declaredLength != null) dataStart++
+    val bytes = tokens.drop(dataStart)
+        .filter { it.length == 2 && it.all { char -> char in "0123456789ABCDEF" } }
+        .map { it.toInt(16) }
+        .let { values -> if (declaredLength != null) values.take(declaredLength) else values }
+    if (bytes.isEmpty()) null else CanFrame(id, bytes.toIntArray())
+}.toList()

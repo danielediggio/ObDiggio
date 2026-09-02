@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
 import android.util.Log
@@ -14,12 +15,19 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-data class BleDevice(val name: String, val address: String, val rssi: Int) {
+enum class AdapterConnection { BLE, CLASSIC }
+
+data class BleDevice(
+    val name: String,
+    val address: String,
+    val rssi: Int,
+    val connection: AdapterConnection = AdapterConnection.BLE
+) {
     fun looksLikeObd(): Boolean {
         val n = name.uppercase()
         return listOf("OBD", "ELM", "ICAR", "VGATE", "VIECAR", "VLINK").any { n.contains(it) }
     }
-    override fun toString() = "$name [$address] $rssi dBm"
+    override fun toString() = "$name [$address] $rssi dBm ${connection.name}"
 }
 
 class BleTransport(
@@ -38,8 +46,10 @@ class BleTransport(
     private var gatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
     private var notifyChar: BluetoothGattCharacteristic? = null
+    private var writeSupportsResponse = false
     @Volatile private var gattConnected = false
     private var servicesLatch: CountDownLatch? = null
+    private var writeLatch: CountDownLatch? = null
 
     companion object {
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -58,7 +68,9 @@ class BleTransport(
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
-                BluetoothGatt.STATE_CONNECTED -> g.discoverServices()
+                BluetoothGatt.STATE_CONNECTED -> {
+                    if (status == BluetoothGatt.GATT_SUCCESS) g.discoverServices() else gattConnected = false
+                }
                 BluetoothGatt.STATE_DISCONNECTED -> gattConnected = false
             }
         }
@@ -75,6 +87,10 @@ class BleTransport(
 
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
             feed(value)
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            writeLatch?.countDown()
         }
     }
 
@@ -120,6 +136,8 @@ class BleTransport(
         gatt = null
         writeChar = null
         notifyChar = null
+        writeSupportsResponse = false
+        writeLatch = null
     }
 
     override fun write(data: ByteArray) {
@@ -127,14 +145,35 @@ class BleTransport(
         val ch = writeChar ?: error("Caratteristica di scrittura non disponibile")
         data.toList().chunked(20).forEach { chunk ->
             val bytes = chunk.toByteArray()
-            if (Build.VERSION.SDK_INT >= 33) {
-                g.writeCharacteristic(ch, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+            if (writeSupportsResponse) {
+                val latch = CountDownLatch(1)
+                writeLatch = latch
+                val accepted = if (Build.VERSION.SDK_INT >= 33) {
+                    g.writeCharacteristic(ch, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    run {
+                        ch.value = bytes
+                        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        g.writeCharacteristic(ch)
+                    }
+                }
+                check(accepted) { "Scrittura BLE rifiutata dall'adattatore" }
+                check(latch.await(2, TimeUnit.SECONDS)) { "Timeout scrittura BLE" }
             } else {
-                @Suppress("DEPRECATION")
-                ch.value = bytes
-                ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(ch)
+                if (Build.VERSION.SDK_INT >= 33) {
+                    check(g.writeCharacteristic(ch, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == BluetoothStatusCodes.SUCCESS) {
+                        "Scrittura BLE rifiutata dall'adattatore"
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    run {
+                        ch.value = bytes
+                        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        check(g.writeCharacteristic(ch)) { "Scrittura BLE rifiutata dall'adattatore" }
+                    }
+                }
+                Thread.sleep(25)
             }
         }
     }
@@ -168,5 +207,6 @@ class BleTransport(
         }
         notifyChar = notify
         writeChar = write
+        writeSupportsResponse = write?.let { (it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 } == true
     }
 }
