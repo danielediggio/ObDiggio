@@ -19,7 +19,7 @@ abstract class Transport {
         synchronized(lock) { buffer.clear() }
     }
 
-    fun readUntil(terminator: Byte = '>', timeoutMs: Long = 5000): ByteArray {
+    fun readUntil(terminator: Byte = '>'.code.toByte(), timeoutMs: Long = 5000): ByteArray {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000L
         while (System.nanoTime() < deadline) {
             synchronized(lock) {

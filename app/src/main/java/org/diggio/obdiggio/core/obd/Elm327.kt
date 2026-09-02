@@ -70,7 +70,7 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
     @Synchronized
     private fun sendRaw(command: String): String {
         transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
-        val raw = transport.readUntil('>', timeoutMs)
+        val raw = transport.readUntil('>'.code.toByte(), timeoutMs)
         return String(raw, Charsets.US_ASCII)
     }
 
@@ -93,9 +93,9 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
     @Synchronized
     fun queryPhysical(txId: Int, command: String): String {
         transport.write("ATSH %03X\r".format(txId).toByteArray(Charsets.US_ASCII))
-        transport.readUntil('>', 1000)          // wait for "OK\r\n>"
+        transport.readUntil('>'.code.toByte(), 1000)          // wait for "OK\r\n>"
         transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
-        val raw = transport.readUntil('>', timeoutMs)
+        val raw = transport.readUntil('>'.code.toByte(), timeoutMs)
         return clean(String(raw, Charsets.US_ASCII))
     }
 
@@ -106,7 +106,7 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
     @Synchronized
     fun resetToFunctional() {
         transport.write("ATSH 7DF\r".toByteArray(Charsets.US_ASCII))
-        transport.readUntil('>', 500)
+        transport.readUntil('>'.code.toByte(), 500)
     }
 
     // ---- Connection -----------------------------------------------------------
