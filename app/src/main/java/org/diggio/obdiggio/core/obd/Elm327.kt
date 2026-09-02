@@ -77,34 +77,65 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
     fun query(command: String): String = clean(sendRaw(command))
 
     /**
+     * Force ISO 15765-4 CAN 500kbaud (ATSP6) and tune the adapter for VAG
+     * physical-address UDS queries. Must be called once before any [queryPhysical]
+     * session so the adapter is on the right bus even when auto-detect (ATSP0) failed.
+     *
+     * Settings applied:
+     *   ATSP6  — ISO 15765-4 CAN 11-bit 500kbaud (VAG high-speed CAN bus)
+     *   ATCAF1 — CAN auto-formatting ON (ELM327 reassembles multi-frame responses)
+     *   ATAT2  — adaptive timing mode 2 (less aggressive wait, more reliable)
+     *   ATST19 — byte timeout = 25 × 4ms = 100ms per CAN frame (suits CAN ECUs)
+     */
+    @Synchronized
+    fun setupForVagCan() {
+        sendRaw("ATSP6")        // force ISO 15765-4 CAN 11-bit 500kbaud
+        Thread.sleep(100)
+        sendRaw("ATCAF1")       // auto-format: ELM327 handles ISO 15765-4 transport
+        sendRaw("ATAT2")        // adaptive timing aggressive
+        sendRaw("ATST19")       // per-frame timeout ~100ms
+    }
+
+    /**
      * Send [command] to a specific ECU identified by [txId] (physical CAN address).
+     * [rxId] is the expected response address (normally txId + 8); passing it enables
+     * explicit CAN receive filtering via ATCRA, which is required for many cheap
+     * ELM327 clones that do not implement the automatic txId+8 filter.
      *
      * This is done atomically under the same lock as [sendRaw]:
      *   1. ATSH [txId]   — set outgoing CAN header (target ECU address)
-     *   2. [command]\r   — send the diagnostic request
-     *   3. read until '>' — collect ECU response
-     *
-     * The ELM327 automatically filters incoming frames to [txId + 8], which is
-     * the standard physical response address (e.g. TX=0x7E0 → RX=0x7E8).
+     *   2. ATCRA [rxId]  — filter incoming frames to the ECU's response address
+     *   3. [command]\r   — send the diagnostic request
+     *   4. read until '>' — collect ECU response
      *
      * ⚠ This leaves the adapter in physical-address mode. Call [resetToFunctional]
      * when you are done with ECU-specific queries so normal OBD-II polling works.
      */
     @Synchronized
-    fun queryPhysical(txId: Int, command: String): String {
+    fun queryPhysical(txId: Int, rxId: Int, command: String): String {
         transport.write("ATSH %03X\r".format(txId).toByteArray(Charsets.US_ASCII))
-        transport.readUntil('>'.code.toByte(), 1000)          // wait for "OK\r\n>"
+        transport.readUntil('>'.code.toByte(), 500)
+        transport.write("ATCRA %03X\r".format(rxId).toByteArray(Charsets.US_ASCII))
+        transport.readUntil('>'.code.toByte(), 500)
         transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
         val raw = transport.readUntil('>'.code.toByte(), timeoutMs)
         return clean(String(raw, Charsets.US_ASCII))
     }
 
+    /** Backwards-compatible overload: derives rxId as txId + 8. */
+    @Synchronized
+    fun queryPhysical(txId: Int, command: String): String =
+        queryPhysical(txId, txId + 8, command)
+
     /**
-     * Restore functional addressing (ATSH 7DF) so Mode 01/03/07 queries
-     * reach all ECUs again. Must be called after a physical-address session.
+     * Restore functional addressing (ATSH 7DF) and clear the CAN receive filter
+     * (ATCRA) so Mode 01/03/07 queries reach all ECUs again.
+     * Must be called after a physical-address session.
      */
     @Synchronized
     fun resetToFunctional() {
+        transport.write("ATCRA\r".toByteArray(Charsets.US_ASCII))  // clear ATCRA filter
+        transport.readUntil('>'.code.toByte(), 500)
         transport.write("ATSH 7DF\r".toByteArray(Charsets.US_ASCII))
         transport.readUntil('>'.code.toByte(), 500)
     }

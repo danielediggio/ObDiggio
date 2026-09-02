@@ -49,16 +49,22 @@ class VagDiag(private val elm: Elm327) {
      * UDS-capable ECU must answer — much faster than a full DTC read.
      * Unreachable ECUs (NO DATA / timeout) are marked alive=false.
      */
-    fun scanEcus(): List<VagEcuResult> =
-        VagEcus.all.map { ecu ->
+    fun scanEcus(): List<VagEcuResult> {
+        // Force ATSP6 (500kbaud CAN) before any physical-address query.
+        // Auto-detect (ATSP0) may fail when the engine won't start and Mode-01
+        // goes unanswered; without this the adapter could be on the wrong protocol.
+        elm.setupForVagCan()
+        return VagEcus.all.map { ecu ->
             runCatching {
-                val resp = elm.queryPhysical(ecu.txId, "3E 00")
+                val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "3E 00")
                 val alive = isPositiveResponse(resp, 0x3E)
-                VagEcuResult(ecu = ecu, alive = alive)
+                VagEcuResult(ecu = ecu, alive = alive,
+                    error = if (!alive) "Nessuna risposta" else null)
             }.getOrElse { ex ->
                 VagEcuResult(ecu = ecu, alive = false, error = ex.message)
             }
         }
+    }
 
     /**
      * Read DTCs from a single ECU.
@@ -76,8 +82,11 @@ class VagDiag(private val elm: Elm327) {
      */
     fun readDtcs(ecu: VagEcu): VagEcuResult =
         runCatching {
+            // Ensure correct protocol for standalone DTC reads (in case called without scanEcus)
+            elm.setupForVagCan()
+
             // Step 1 — probe
-            val probe = elm.queryPhysical(ecu.txId, "3E 00")
+            val probe = elm.queryPhysical(ecu.txId, ecu.rxId, "3E 00")
             if (!isPositiveResponse(probe, 0x3E)) {
                 val nrc = extractNrc(probe, 0x3E)
                 return@runCatching VagEcuResult(
@@ -89,10 +98,10 @@ class VagDiag(private val elm: Elm327) {
             // Step 2 — open extended session (needed for ECUs with additional protections)
             // We ignore the response: if the ECU doesn't support it, it returns 7F and we
             // still try the DTC read — many ECUs answer 0x19 in default session anyway.
-            elm.queryPhysical(ecu.txId, "10 03")
+            elm.queryPhysical(ecu.txId, ecu.rxId, "10 03")
 
             // Step 3 — read DTCs
-            val resp = elm.queryPhysical(ecu.txId, "19 02 FF")
+            val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "19 02 FF")
             if (!isPositiveResponse(resp, 0x19)) {
                 val nrc = extractNrc(resp, 0x19)
                 val errMsg = when (nrc) {
@@ -124,8 +133,8 @@ class VagDiag(private val elm: Elm327) {
      */
     fun clearDtcs(ecu: VagEcu): Boolean =
         runCatching {
-            elm.queryPhysical(ecu.txId, "10 03")   // extended session
-            val resp = elm.queryPhysical(ecu.txId, "14 FF FF FF")
+            elm.queryPhysical(ecu.txId, ecu.rxId, "10 03")   // extended session
+            val resp = elm.queryPhysical(ecu.txId, ecu.rxId, "14 FF FF FF")
             isPositiveResponse(resp, 0x14)
         }.getOrElse { false }
 
