@@ -76,6 +76,39 @@ class Elm327(val transport: Transport, private val timeoutMs: Long = 5000) {
 
     fun query(command: String): String = clean(sendRaw(command))
 
+    /**
+     * Send [command] to a specific ECU identified by [txId] (physical CAN address).
+     *
+     * This is done atomically under the same lock as [sendRaw]:
+     *   1. ATSH [txId]   — set outgoing CAN header (target ECU address)
+     *   2. [command]\r   — send the diagnostic request
+     *   3. read until '>' — collect ECU response
+     *
+     * The ELM327 automatically filters incoming frames to [txId + 8], which is
+     * the standard physical response address (e.g. TX=0x7E0 → RX=0x7E8).
+     *
+     * ⚠ This leaves the adapter in physical-address mode. Call [resetToFunctional]
+     * when you are done with ECU-specific queries so normal OBD-II polling works.
+     */
+    @Synchronized
+    fun queryPhysical(txId: Int, command: String): String {
+        transport.write("ATSH %03X\r".format(txId).toByteArray(Charsets.US_ASCII))
+        transport.readUntil('>', 1000)          // wait for "OK\r\n>"
+        transport.write(("$command\r").toByteArray(Charsets.US_ASCII))
+        val raw = transport.readUntil('>', timeoutMs)
+        return clean(String(raw, Charsets.US_ASCII))
+    }
+
+    /**
+     * Restore functional addressing (ATSH 7DF) so Mode 01/03/07 queries
+     * reach all ECUs again. Must be called after a physical-address session.
+     */
+    @Synchronized
+    fun resetToFunctional() {
+        transport.write("ATSH 7DF\r".toByteArray(Charsets.US_ASCII))
+        transport.readUntil('>', 500)
+    }
+
     // ---- Connection -----------------------------------------------------------
 
     fun connect() {

@@ -19,6 +19,9 @@ import org.diggio.obdiggio.core.obd.Pid
 import org.diggio.obdiggio.core.obd.PidResult
 import org.diggio.obdiggio.core.obd.MockTransport
 import org.diggio.obdiggio.core.obd.Pids
+import org.diggio.obdiggio.core.vag.VagDiag
+import org.diggio.obdiggio.core.vag.VagEcuResult
+import org.diggio.obdiggio.core.vag.VagEcus
 
 private val DEFAULT_CODES    = listOf(12, 13, 5, 11, 4, 17, 15, 16, 66)
 private val CANDIDATE_CODES  = listOf(12, 13, 11, 51, 5, 92, 15, 16, 4, 17, 73, 44, 45, 35, 47, 66, 70, 31, 33, 94)
@@ -31,10 +34,17 @@ data class UiState(
     val status: String = "Non connesso",
     val values: Map<String, PidResult> = emptyMap(),
     val boostKpa: Double? = null,
+    // ── Standard OBD-II DTC ───────────────────────────────────────────────────
     val dtcGroups: List<DtcGroup>? = null,
     val dtcBusy: Boolean = false,
+    // ── Freeze frame ──────────────────────────────────────────────────────────
     val freeze: FreezeFrame? = null,
     val freezeBusy: Boolean = false,
+    // ── VAG multi-ECU scan ────────────────────────────────────────────────────
+    val vagResults: List<VagEcuResult>? = null,  // null = not yet scanned
+    val vagBusy: Boolean = false,
+    val vagProgress: String = "",                // e.g. "Lettura Motore…"
+    // ── Generic message / error ───────────────────────────────────────────────
     val message: String? = null
 )
 
@@ -54,7 +64,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private var transport: BleTransport? = null
     private var pollJob: Job? = null
 
-    // ---- Connection -----------------------------------------------------------
+    // ── Connection ────────────────────────────────────────────────────────────
 
     fun connect(useMock: Boolean) {
         if (_state.value.connecting || _state.value.connected) return
@@ -62,7 +72,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 connecting = true, connected = false, usingMock = useMock,
                 status = "Connessione…", values = emptyMap(), boostKpa = null,
-                dtcGroups = null, dtcBusy = false, freeze = null, freezeBusy = false, message = null
+                dtcGroups = null, dtcBusy = false, freeze = null, freezeBusy = false,
+                vagResults = null, vagBusy = false, message = null
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -108,13 +119,11 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { elm?.close() }
             elm = null
-            withContext(Dispatchers.Main) {
-                _state.update { UiState() }
-            }
+            withContext(Dispatchers.Main) { _state.update { UiState() } }
         }
     }
 
-    // ---- Polling --------------------------------------------------------------
+    // ── Polling ───────────────────────────────────────────────────────────────
 
     private fun startPolling() {
         pollJob?.cancel()
@@ -123,9 +132,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 val results = mutableMapOf<String, PidResult>()
                 for (pid in dashboardPids) {
-                    // sendRaw is @Synchronized — if a DTC read is in flight this
-                    // call will simply block until that read finishes, so there is
-                    // no interleaving. No explicit locking needed here.
+                    // sendRaw is @Synchronized — if a DTC / VAG read is in flight
+                    // this call will simply block until that read finishes.
                     runCatching { e.readPid(pid) }.getOrNull()?.let { results[pid.key] = it }
                 }
                 val boost = computeBoost(results)
@@ -138,27 +146,19 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun computeBoost(values: Map<String, PidResult>): Double? {
-        val map = values[Pids[11]?.key]?.value ?: return null
+        val map  = values[Pids[11]?.key]?.value ?: return null
         val baro = values[Pids[51]?.key]?.value ?: 101.3
         return maxOf(map - baro, 0.0)
     }
 
-    // ---- DTC operations -------------------------------------------------------
-    // Pattern for every DTC / freeze operation:
-    //   1. Cancel pollJob — avoids concurrent commands on the same transport.
-    //      (sendRaw is also @Synchronized as a belt-and-suspenders guard.)
-    //   2. Perform the operation.
-    //   3. Restart pollJob when done (even on failure).
-    // This makes DTC reads reliable regardless of where the poll loop was.
+    // ── Standard OBD-II DTC operations ───────────────────────────────────────
+    // Pattern: cancel poll → wait → operate → restart poll (even on failure).
 
     fun readDtcs() {
         val e = elm ?: return
-        pollJob?.cancel()
-        pollJob = null
+        pollJob?.cancel(); pollJob = null
         _state.update { it.copy(dtcBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            // Give any in-flight poll command a moment to drain before we start.
-            // (sendRaw times out after 5 s max, but normally finishes in <300 ms.)
             delay(250)
             runCatching {
                 val groups = readAllDtcGroups(e)
@@ -176,19 +176,18 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearDtcs() {
         val e = elm ?: return
-        pollJob?.cancel()
-        pollJob = null
+        pollJob?.cancel(); pollJob = null
         _state.update { it.copy(dtcBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
             delay(250)
             runCatching {
                 e.clearDtcs()
                 withContext(Dispatchers.Main) {
-                    _state.update { it.copy(dtcGroups = emptyList(), dtcBusy = false, message = "DTC cancellati") }
+                    _state.update { it.copy(dtcGroups = emptyList(), dtcBusy = false, message = "DTC OBD-II cancellati") }
                 }
             }.onFailure { ex ->
                 withContext(Dispatchers.Main) {
-                    _state.update { it.copy(dtcBusy = false, message = "Errore cancellazione DTC: ${ex.message}") }
+                    _state.update { it.copy(dtcBusy = false, message = "Errore cancellazione: ${ex.message}") }
                 }
             }
             startPolling()
@@ -197,14 +196,13 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     fun readFreezeFrame() {
         val e = elm ?: return
-        pollJob?.cancel()
-        pollJob = null
+        pollJob?.cancel(); pollJob = null
         _state.update { it.copy(freezeBusy = true, message = null) }
         viewModelScope.launch(Dispatchers.IO) {
             delay(250)
             runCatching {
-                val dtc = e.readFreezeFrameDtc()
-                val pids = FREEZE_CODES.mapNotNull { Pids[it] }
+                val dtc    = e.readFreezeFrameDtc()
+                val pids   = FREEZE_CODES.mapNotNull { Pids[it] }
                 val values = pids.mapNotNull { runCatching { e.readFreezeFramePid(it) }.getOrNull() }
                 FreezeFrame(dtc, values)
             }.fold(
@@ -224,14 +222,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun readAllDtcGroups(e: Elm327): List<DtcGroup> {
-        // Each mode is read separately. Failures are surfaced via state.message rather
-        // than silently swallowed, while still returning whatever groups succeeded.
         val errors = mutableListOf<String>()
         fun safe(label: String, fn: () -> List<Dtc>): List<Dtc> =
-            runCatching(fn).getOrElse { ex ->
-                errors.add("$label: ${ex.message}")
-                emptyList()
-            }
+            runCatching(fn).getOrElse { ex -> errors.add("$label: ${ex.message}"); emptyList() }
 
         val groups = listOf(
             DtcGroup("Memorizzati",  safe("Mode 03") { e.readDtcs() }),
@@ -240,16 +233,85 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         ).filter { it.codes.isNotEmpty() }
 
         if (errors.isNotEmpty()) {
-            // Report in state so the user can see what went wrong
             val msg = errors.joinToString(" | ")
-            viewModelScope.launch(Dispatchers.Main) {
-                _state.update { it.copy(message = msg) }
-            }
+            viewModelScope.launch(Dispatchers.Main) { _state.update { it.copy(message = msg) } }
         }
         return groups
     }
 
-    // ---- Helpers --------------------------------------------------------------
+    // ── VAG multi-ECU operations ──────────────────────────────────────────────
+
+    /**
+     * Scan all known VAG ECUs and immediately read their DTCs.
+     *
+     * Flow:
+     *   1. Cancel poll job (exclusive transport access)
+     *   2. For each ECU: probe with TesterPresent, then read DTCs via UDS 19 02 FF
+     *   3. Update state incrementally after each ECU so the UI shows progress
+     *   4. Restore functional addressing (ATSH 7DF)
+     *   5. Restart poll job
+     */
+    fun scanVag() {
+        val e = elm ?: return
+        pollJob?.cancel(); pollJob = null
+        _state.update { it.copy(vagBusy = true, vagResults = emptyList(), vagProgress = "Avvio scan…", message = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            delay(250) // let in-flight poll drain
+            val diag = VagDiag(e)
+            val collected = mutableListOf<VagEcuResult>()
+            for (ecu in VagEcus.all) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(vagProgress = "Lettura ${ecu.name}…") }
+                }
+                val result = diag.readDtcs(ecu)
+                collected.add(result)
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(vagResults = collected.toList()) }
+                }
+            }
+            runCatching { diag.restoreFunctionalAddress() }
+            val totalDtcs = collected.sumOf { it.dtcs.size }
+            val msg = when {
+                totalDtcs == 0 -> "Scan VAG completato — nessun DTC trovato"
+                else           -> "Scan VAG: $totalDtcs DTC in ${collected.count { it.dtcs.isNotEmpty() }} ECU"
+            }
+            withContext(Dispatchers.Main) {
+                _state.update { it.copy(vagBusy = false, vagProgress = "", message = msg) }
+            }
+            startPolling()
+        }
+    }
+
+    /**
+     * Clear DTCs on all VAG ECUs that have faults (UDS service 0x14).
+     */
+    fun clearVagDtcs() {
+        val e = elm ?: return
+        val currentResults = _state.value.vagResults?.filter { it.alive && it.dtcs.isNotEmpty() }
+        if (currentResults.isNullOrEmpty()) return
+        pollJob?.cancel(); pollJob = null
+        _state.update { it.copy(vagBusy = true, vagProgress = "Cancellazione DTC VAG…", message = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            delay(250)
+            val diag = VagDiag(e)
+            var cleared = 0
+            for (result in currentResults) {
+                if (diag.clearDtcs(result.ecu)) cleared++
+            }
+            runCatching { diag.restoreFunctionalAddress() }
+            withContext(Dispatchers.Main) {
+                _state.update { it.copy(
+                    vagBusy = false,
+                    vagProgress = "",
+                    vagResults = null,  // force re-scan to confirm
+                    message = "Cancellati DTC su $cleared ECU — esegui nuovo scan per verificare"
+                ) }
+            }
+            startPolling()
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private suspend fun setStatus(s: String) = withContext(Dispatchers.Main) {
         _state.update { it.copy(status = s) }

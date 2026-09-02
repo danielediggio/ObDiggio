@@ -162,7 +162,123 @@ data class Dtc(val code: String) {
             "U0101" to "Persa comunicazione con centralina cambio (TCM)",
             "U0121" to "Persa comunicazione con centralina ABS",
             "U0155" to "Persa comunicazione con quadro strumenti",
-            "U0401" to "Dati non validi dalla centralina motore"
+            "U0401" to "Dati non validi dalla centralina motore",
+
+            // ── VAG / Audi manufacturer-specific codes (P1xxx, P3xxx) ─────────────
+            // Common on C6 A6, Q7, Touareg and other VAG group vehicles.
+            // P1xxx = powertrain manufacturer-specific (VAG group)
+            // P3xxx = VAG extended range
+
+            // Immobilizer / anti-theft (CRITICAL for no-start diagnosis on EDC16/MED17)
+            // These are the key codes for "non parte" on VAG diesel/petrol with IMMO3/IMMO4.
+            "P1570" to "Centralina bloccata — immobilizer attivo ⚠ NON PARTE",
+            "P1571" to "Immobilizer — accensione bloccata (IMMO attivo)",
+            "P1572" to "Segnale immobilizer mancante o difettoso",
+            "P1573" to "Immobilizer — centralina non codificata (assenza coding)",
+            "P1574" to "Immobilizer — mancata sincronizzazione con quadro strumenti",
+            "P1575" to "Immobilizer — errore dati EEPROM centralina",
+            "P1576" to "Immobilizer — dati chiave non riconosciuti",
+            "P1577" to "Immobilizer — tentativo di manomissione rilevato",
+            "P1578" to "Immobilizer — errore comunicazione CAN con J285",
+
+            // Injectors / fuel system (2.7 TDI — common rail diesel)
+            "P1088" to "Regolazione pressione rail — limite minimo raggiunto",
+            "P1089" to "Regolazione pressione rail — limite massimo raggiunto",
+            "P1090" to "Iniettore cil. 1 — adattamento fuori range (minimo)",
+            "P1091" to "Iniettore cil. 2 — adattamento fuori range (minimo)",
+            "P1092" to "Iniettore cil. 3 — adattamento fuori range (minimo)",
+            "P1093" to "Iniettore cil. 4 — adattamento fuori range (minimo)",
+            "P1094" to "Iniettore cil. 5 — adattamento fuori range (minimo)",
+            "P1095" to "Iniettore cil. 6 — adattamento fuori range (minimo)",
+            "P1100" to "Iniettore cil. 1 — adattamento fuori range (massimo)",
+            "P1101" to "Iniettore cil. 2 — adattamento fuori range (massimo)",
+            "P1102" to "Iniettore cil. 3 — adattamento fuori range (massimo)",
+            "P1103" to "Iniettore cil. 4 — adattamento fuori range (massimo)",
+            "P1104" to "Iniettore cil. 5 — adattamento fuori range (massimo)",
+            "P1105" to "Iniettore cil. 6 — adattamento fuori range (massimo)",
+
+            // Mass air flow / boost
+            "P1555" to "Sensore MAF — discrepanza con MAP/turbo",
+            "P1556" to "Pressione di sovralimentazione — limitazione attiva",
+            "P1557" to "Pressione di sovralimentazione troppo bassa — turbo",
+            "P1558" to "Attuatore valvola wastegate — circuito aperto",
+            "P1559" to "Attuatore valvola wastegate — cortocircuito",
+
+            // EGR (diesel)
+            "P1403" to "Valvola EGR diesel — apertura insufficiente",
+            "P1404" to "Valvola EGR diesel — chiusura insufficiente",
+            "P1405" to "Valvola EGR diesel — cortocircuito massa",
+            "P1406" to "Valvola EGR diesel — circuito aperto",
+
+            // Glow plugs (diesel cold-start — important for non-start in inverno)
+            "P0380" to "Circuito candelette — anomalia",
+            "P0381" to "Spia candelette — anomalia circuito",
+            "P1397" to "Modulo controllo candelette — comunicazione CAN",
+            "P1411" to "Candeletta cil. 1 — segnale difettoso",
+            "P1412" to "Candeletta cil. 2 — segnale difettoso",
+            "P1413" to "Candeletta cil. 3 — segnale difettoso",
+            "P1414" to "Candeletta cil. 4 — segnale difettoso",
+            "P1415" to "Candeletta cil. 5 — segnale difettoso",
+            "P1416" to "Candeletta cil. 6 — segnale difettoso",
+
+            // Fuel pump / supply (common rail)
+            "P3105" to "Relè pompa carburante — cortocircuito o aperto",
+            "P3106" to "Pompa carburante — bassa pressione alimentazione",
+            "P3108" to "Pompa alta pressione — portata insufficiente",
+
+            // Crankshaft / camshaft (no-start cause)
+            "P1338" to "Sensore posizione albero motore — segnale intermittente",
+            "P1340" to "Riconoscimento cilindri — segnale albero motore mancante",
+            "P1341" to "Posizione albero a camme — discrepanza con CKP (banco 1)",
+            "P1344" to "Posizione albero a camme — discrepanza con CKP (banco 2)",
+
+            // Throttle / accelerator pedal (VAG drive-by-wire)
+            "P1545" to "Valvola farfalla — posizione fuori range",
+            "P1547" to "Valvola farfalla — cortocircuito positivo",
+            "P1549" to "Valvola farfalla — circuito aperto",
+
+            // CAN bus / network (gateway errors)
+            "P1600" to "CAN-Bus — alimentazione ECU motore assente",
+            "P1601" to "CAN-Bus — timeout comunicazione con quadro strumenti",
+            "P1612" to "CAN-Bus — messaggio da centralina cambio assente",
+            "P1614" to "CAN-Bus — messaggio da ABS/ESP assente",
+            "P1649" to "CAN-Bus — messaggio implausibile da centralina cambio",
+            "P1676" to "CAN-Bus — messaggio da gateway assente",
+
+            // Transmission (Tiptronic / ZF)
+            "P0730" to "Rapporto di trasmissione errato",
+            "P0731" to "Marcia 1 — rapporto errato",
+            "P0732" to "Marcia 2 — rapporto errato",
+            "P0733" to "Marcia 3 — rapporto errato",
+            "P0734" to "Marcia 4 — rapporto errato",
+            "P0735" to "Marcia 5 — rapporto errato",
+            "P0736" to "Marcia inversa — rapporto errato",
+            "P1719" to "Selettore marce — segnale non plausibile",
+            "P1722" to "Selettore P/N — segnale assente",
+
+            // Misc ECU / electrical
+            "P0600" to "CAN-Bus — errore di comunicazione generale",
+            "P0601" to "Memoria ROM centralina — errore checksum",
+            "P0602" to "Centralina non programmata (coding assente)",
+            "P0604" to "Memoria RAM centralina — errore",
+            "P1611" to "MIL richiesta dalla centralina cambio",
+            "P1777" to "Consenso di avviamento — segnale mancante",
+            "P1778" to "Segnale N73 (selezione P/N cambio) — non plausibile",
+
+            // Fuel shutoff / start permission (VAG EDC16, critical for no-start)
+            "P3081" to "Autorizzazione avviamento negata dalla centralina cambio",
+            "P3082" to "Valvola di intercettazione carburante — circuito",
+            "P0616" to "Relè motorino avviamento — cortocircuito",
+            "P0617" to "Relè motorino avviamento — circuito aperto",
+            "P0685" to "Relè principale centralina — circuito aperto",
+            "P0686" to "Relè principale centralina — cortocircuito",
+            "P0687" to "Relè principale centralina — tensione alta",
+
+            // AdBlue / SCR (2.7 TDI some variants)
+            "P207F" to "Qualità reagente AdBlue non conforme",
+            "P20E8" to "Portata dosatore AdBlue — fuori range",
+            "P249D" to "Riscaldatore linea AdBlue — cortocircuito",
+            "P249E" to "Riscaldatore linea AdBlue — circuito aperto"
         )
 
         fun describe(code: String): String = DESCRIPTIONS[code] ?: structural(code)
